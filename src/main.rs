@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::{collections::HashMap, process::Stdio, sync::Arc, time::Duration};
 
 use anyhow::Result;
@@ -16,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use zvariant::Type;
 
-const OBJECT_PATH: &str = "/lol/happens/CosmicOsd";
+const OBJECT_PATH: &str = "/lol/happens/pk";
+
+const CSS: &str = grass::include!("./src/main.scss");
 
 #[zbus::proxy(
   default_service = "org.freedesktop.login1",
@@ -79,7 +82,7 @@ pub struct Identity<'a> {
 #[allow(unused)]
 enum Event {
   ReadPassword(flume::Sender<String>, CancellationToken),
-  ReadFingerprint,
+  ReadFingerprint(CancellationToken),
   End,
 }
 
@@ -171,7 +174,10 @@ impl PolkitAgent {
       .stdout(Stdio::piped())
       .stderr(Stdio::null())
       .spawn()
-      .unwrap();
+      .map_err(|err| {
+        error!("Failed to spawn agent helper: {err}");
+        PolkitError::Failed
+      })?;
 
     let mut stdin = process.stdin.take().expect("take stdin");
     let stdout = process.stdout.take().expect("take stdout");
@@ -243,8 +249,9 @@ impl PolkitAgent {
 
     match prefix {
       "PAM_PROMPT_ECHO_OFF" => {
-        // We just assume it's a password prompt
+        // TODO: Check if this is actually a password prompt
         debug!("PAM blind prompt: {pam_msg}");
+
         self
           .sender
           .send_async(Event::ReadPassword(password_tx, token))
@@ -261,7 +268,19 @@ impl PolkitAgent {
         Err(PolkitError::Failed)
       }
       "PAM_ERROR_MSG" => Ok(true),
-      "PAM_TEXT_INFO" => Ok(true),
+      "PAM_TEXT_INFO" => {
+        info!("Got text: {pam_msg}");
+        self
+          .sender
+          .send_async(Event::ReadFingerprint(token))
+          .await
+          .map_err(|_| {
+            error!("Failed to send password prompt");
+            PolkitError::Failed
+          })?;
+
+        Ok(true)
+      }
       "SUCCESS" => Ok(false),
       "FAILURE" => Err(PolkitError::Failed),
       _ => {
@@ -273,6 +292,44 @@ impl PolkitAgent {
 }
 
 fn main() -> Result<ExitCode> {
+  tracing_subscriber::fmt::init();
+  let app = gtk4::Application::builder()
+    .application_id("lol.happens.pkagent")
+    .flags(gtk4::gio::ApplicationFlags::default() | gtk4::gio::ApplicationFlags::NON_UNIQUE)
+    .build();
+
+  app.connect_activate(move |app| {
+    let ((tx, _rx), token) = (flume::unbounded::<String>(), CancellationToken::new());
+
+    let display = gtk4::gdk::Display::default().unwrap();
+
+    let style_provider = gtk4::CssProvider::new();
+    style_provider.load_from_string(CSS);
+
+    gtk4::style_context_add_provider_for_display(
+      &display,
+      &style_provider,
+      gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    {
+      let app = app.clone();
+      let token = token.clone();
+      glib::spawn_future_local(async move {
+        token.cancelled().await;
+        app.quit();
+      });
+    }
+
+    // create_overlays(app);
+    let window = create_window(app);
+    show_password_prompt(&window, tx, token);
+  });
+
+  Ok(app.run())
+}
+
+fn main2() -> Result<ExitCode> {
   tracing_subscriber::fmt::init();
 
   let app = gtk4::Application::builder()
@@ -331,9 +388,9 @@ fn main() -> Result<ExitCode> {
             show_password_prompt(window, tx, token);
             window.present();
           }
-          Event::ReadFingerprint => {
+          Event::ReadFingerprint(token) => {
             let window = dialog.get_or_insert_with(|| create_window(&app));
-            show_fingerprint_prompt(window);
+            show_fingerprint_prompt(window, token);
             window.present();
           }
           Event::End => {
@@ -353,12 +410,47 @@ fn main() -> Result<ExitCode> {
   Ok(code)
 }
 
+fn create_overlays(app: &gtk4::Application) {
+  let outputs = gtk4::gdk::Display::default().unwrap().monitors();
+  for i in 0..outputs.n_items() {
+    let output = outputs
+      .item(i)
+      .unwrap()
+      .downcast::<gtk4::gdk::Monitor>()
+      .unwrap();
+
+    let window = gtk4::ApplicationWindow::builder()
+      .application(app)
+      .css_classes(["overlay"])
+      .build();
+
+    window.init_layer_shell();
+    window.set_monitor(&output);
+    window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
+    window.set_layer(gtk4_layer_shell::Layer::Overlay);
+
+    window.set_anchor(gtk4_layer_shell::Edge::Top, true);
+    window.set_anchor(gtk4_layer_shell::Edge::Bottom, true);
+    window.set_anchor(gtk4_layer_shell::Edge::Left, true);
+    window.set_anchor(gtk4_layer_shell::Edge::Right, true);
+
+    window.present();
+
+    window.add_css_class("visible");
+  }
+}
+
 fn create_window(app: &gtk4::Application) -> gtk4::ApplicationWindow {
   let window = gtk4::ApplicationWindow::builder().application(app).build();
 
   window.init_layer_shell();
   window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::OnDemand);
   window.set_layer(gtk4_layer_shell::Layer::Overlay);
+
+  window.set_anchor(gtk4_layer_shell::Edge::Top, true);
+  window.set_anchor(gtk4_layer_shell::Edge::Bottom, true);
+  window.set_anchor(gtk4_layer_shell::Edge::Left, true);
+  window.set_anchor(gtk4_layer_shell::Edge::Right, true);
 
   window
 }
@@ -368,13 +460,21 @@ fn show_password_prompt(
   tx: flume::Sender<String>,
   token: CancellationToken,
 ) {
-  let cancel_button = gtk4::Button::builder().label("Cancel").build();
-  cancel_button.connect_clicked(move |_| {
-    token.cancel();
+  let ctrl = gtk4::EventControllerKey::builder().build();
+  ctrl.connect_key_pressed(move |_ctrl, key, _code, _state| {
+    use gtk4::gdk::Key;
+    if key == Key::Escape {
+      token.cancel();
+      return glib::Propagation::Stop;
+    }
+
+    glib::Propagation::Proceed
   });
 
   let input = gtk4::PasswordEntry::builder()
-    .placeholder_text("password")
+    .placeholder_text("Enter your password")
+    .width_chars(40)
+    .css_classes(["password-entry"])
     .build();
 
   input.connect_activate(move |input| {
@@ -383,19 +483,63 @@ fn show_password_prompt(
     });
   });
 
+  window.add_controller(ctrl);
+
+  let input_container = gtk4::Overlay::builder().child(&input).build();
+
+  let confirm_button = gtk4::Button::builder()
+    .label("go")
+    .valign(gtk4::Align::Center)
+    .halign(gtk4::Align::End)
+    .build();
+
+  input_container.add_overlay(&confirm_button);
+
+  let bbox = gtk4::Box::builder()
+    .orientation(gtk4::Orientation::Vertical)
+    .halign(gtk4::Align::Center)
+    .valign(gtk4::Align::Center)
+    .css_classes(["container"])
+    .spacing(10)
+    .build();
+
+  bbox.append(&input_container);
+
+  window.set_child(Some(&bbox));
+  input.grab_focus();
+
+  window.present();
+  bbox.add_css_class("visible");
+}
+
+fn show_fingerprint_prompt(window: &gtk4::ApplicationWindow, token: CancellationToken) {
+  let ctrl = gtk4::EventControllerKey::builder().build();
+  ctrl.connect_key_pressed(move |_ctrl, key, _code, _state| {
+    use gtk4::gdk::Key;
+    if key == Key::Escape {
+      token.cancel();
+      return glib::Propagation::Stop;
+    }
+
+    glib::Propagation::Proceed
+  });
+
+  window.add_controller(ctrl);
+
+  let label = gtk4::Label::builder()
+    .label("Please touch your fingerprint")
+    .build();
+
   let bbox = gtk4::Box::builder()
     .orientation(gtk4::Orientation::Vertical)
     .spacing(10)
     .build();
 
-  bbox.append(&input);
-  bbox.append(&cancel_button);
-
+  bbox.append(&label);
   window.set_child(Some(&bbox));
-  input.grab_focus();
-}
 
-fn show_fingerprint_prompt(_window: &gtk4::ApplicationWindow) {}
+  window.present();
+}
 
 async fn register_agent(connection: &zbus::Connection, tx: flume::Sender<Event>) -> Result<()> {
   let agent = PolkitAgent {
